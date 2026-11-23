@@ -83,6 +83,41 @@ def build_features(metadata, eeg_folder, is_train=True):
     return np.vstack(X)
 
 
+SPEC_REGIONS = ["LL", "RL", "LP", "RP"]
+SPEC_BANDS = [(0.5, 4), (4, 8), (8, 13), (13, 20)]
+
+
+def extract_spec_features(spec_path, offset_seconds=0.0):
+    """Step 10: features from the 10-minute Kaggle spectrogram around the labelled segment.
+
+    Spectrogram columns are named like 'LL_1.17' (region_frequency in Hz), one row per 2 s.
+    We take log band power per region over the whole 10 min and over the central 60 s.
+    """
+    spec = pd.read_parquet(spec_path)
+    t = spec["time"].to_numpy()
+    window = spec[(t >= offset_seconds) & (t <= offset_seconds + 600)]
+    centre = spec[(t >= offset_seconds + 270) & (t <= offset_seconds + 330)]
+    features = []
+    for region in SPEC_REGIONS:
+        cols = [c for c in spec.columns if c.startswith(region + "_")]
+        freqs = np.array([float(c.split("_")[1]) for c in cols])
+        for lo, hi in SPEC_BANDS:
+            band_cols = [c for c, f in zip(cols, freqs) if lo <= f < hi]
+            for part in (window, centre):
+                values = np.nanmean(np.log1p(np.clip(part[band_cols].to_numpy(dtype=np.float64), 0, None)), axis=1)
+                values = values[np.isfinite(values)]
+                features.extend([values.mean(), values.std()] if len(values) else [0.0, 0.0])
+    return np.asarray(features, dtype=np.float32)
+
+
+def build_spec_features(metadata, spec_folder, is_train=True):
+    paths = [spec_folder / f"{sid}.parquet" for sid in metadata["spectrogram_id"]]
+    offsets = metadata["spectrogram_label_offset_seconds"].to_numpy() if is_train else np.zeros(len(metadata))
+    X = Parallel(n_jobs=-1, batch_size=32, verbose=2)(
+        delayed(extract_spec_features)(p, o) for p, o in zip(paths, offsets))
+    return np.vstack(X)
+
+
 def align_probabilities(model, X, n_classes=6):
     """Keep all six classes even when a small training subset omits one."""
     p = np.zeros((len(X), n_classes), dtype=float)
@@ -217,6 +252,17 @@ def main():
         print("Extracting training EEG features...")
         X = build_features(train, args.data_dir / "train_eegs", is_train=True)
         np.save(cache, X)
+    # Step 10: add the spectrogram features (cached separately).
+    spec_cache = Path(f"train_spec_features_{len(train)}.npy")
+    if spec_cache.exists():
+        print(f"Loading cached spectrogram features from {spec_cache}")
+        X_spec = np.load(spec_cache)
+    else:
+        print("Extracting training spectrogram features...")
+        X_spec = build_spec_features(train, args.data_dir / "train_spectrograms", is_train=True)
+        np.save(spec_cache, X_spec)
+    X = np.hstack([X, X_spec])
+    print(f"Number of features per EEG: {X.shape[1]}")
 
     # Reference: always predict the average vote distribution (no EEG information).
     prior = np.tile(soft_targets.mean(axis=0), (len(soft_targets), 1))
@@ -261,6 +307,7 @@ def main():
         test = pd.read_csv(args.data_dir / "test.csv")
         print("Extracting test EEG features...")
         X_test = build_features(test, args.data_dir / "test_eegs", is_train=False)
+        X_test = np.hstack([X_test, build_spec_features(test, args.data_dir / "test_spectrograms", is_train=False)])
         preds = []
         for m in members:
             print(f"Refitting {m} on all selected training recordings...")
