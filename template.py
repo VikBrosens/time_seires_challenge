@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.signal import welch
+from scipy.stats import wilcoxon
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
@@ -120,6 +121,14 @@ def cross_validate(name, X, soft, groups, n_splits=5):
     return oof
 
 
+def bootstrap_ci(values, q=1000, alpha=0.05, seed=42):
+    """Step 5: bootstrap the mean KL: resample the EEGs with replacement q times."""
+    rng = np.random.default_rng(seed)
+    n = len(values)
+    means = np.array([values[rng.integers(0, n, n)].mean() for _ in range(q)])
+    return np.quantile(means, [alpha / 2, 1 - alpha / 2]), means.std(ddof=1)
+
+
 def expand_soft(X, soft):
     """Step 2: repeat each EEG once per class, weighted by that class's vote fraction.
 
@@ -173,6 +182,15 @@ def main():
         print(f"CV KL divergence {name}: {cv_kl[name]:.4f}")
     best = min(cv_kl, key=cv_kl.get)
     print(f"Best model on CV: {best}")
+
+    # Step 5: how certain are these numbers, and is the difference between the models real?
+    per_eeg = {name: kl_per_eeg(soft_targets, oof[name]) for name in MODELS}
+    for name in MODELS:
+        (low, high), se = bootstrap_ci(per_eeg[name])
+        print(f"{name}: KL {per_eeg[name].mean():.4f}, bootstrap 95% CI [{low:.4f}, {high:.4f}], SE {se:.4f}")
+    # Paired test: both models are evaluated on the same EEGs; KL values are not normal.
+    stat, p = wilcoxon(per_eeg[MODELS[0]], per_eeg[MODELS[1]])
+    print(f"Wilcoxon signed-rank test {MODELS[0]} vs {MODELS[1]}: T={stat:.1f}, p={p:.3g}")
 
     if args.submission:
         print(f"Refitting {best} on all selected training recordings...")
