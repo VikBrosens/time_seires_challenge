@@ -121,6 +121,20 @@ def cross_validate(name, X, soft, groups, n_splits=5):
     return oof
 
 
+def temperature_scale(prob, T):
+    """Step 6: soften (T > 1) or sharpen (T < 1) predicted probabilities."""
+    logp = np.log(prob) / T
+    p = np.exp(logp - logp.max(axis=1, keepdims=True))
+    return p / p.sum(axis=1, keepdims=True)
+
+
+def fit_temperature(soft, prob, grid=np.linspace(0.5, 5.0, 46)):
+    """Step 6: choose the T that minimises the out-of-fold KL (a one-parameter
+    maximum-likelihood fit on validation predictions)."""
+    kls = [kl_per_eeg(soft, temperature_scale(prob, T)).mean() for T in grid]
+    return float(grid[int(np.argmin(kls))])
+
+
 def bootstrap_ci(values, q=1000, alpha=0.05, seed=42):
     """Step 5: bootstrap the mean KL: resample the EEGs with replacement q times."""
     rng = np.random.default_rng(seed)
@@ -174,12 +188,15 @@ def main():
     print(f"Reference KL (always predict the mean vote distribution): {kl_per_eeg(soft_targets, prior).mean():.4f}")
 
     groups = train["patient_id"].to_numpy()
-    oof, cv_kl = {}, {}
+    oof, cv_kl, temps = {}, {}, {}
     for name in MODELS:
         print(f"5-fold GroupKFold cross-validation of {name} (grouped by patient)...")
         oof[name] = cross_validate(name, X, soft_targets, groups)
+        print(f"CV KL divergence {name}: {kl_per_eeg(soft_targets, oof[name]).mean():.4f}")
+        temps[name] = fit_temperature(soft_targets, oof[name])
+        oof[name] = temperature_scale(oof[name], temps[name])
         cv_kl[name] = kl_per_eeg(soft_targets, oof[name]).mean()
-        print(f"CV KL divergence {name}: {cv_kl[name]:.4f}")
+        print(f"  after temperature scaling (T={temps[name]:.2f}): {cv_kl[name]:.4f}")
     best = min(cv_kl, key=cv_kl.get)
     print(f"Best model on CV: {best}")
 
@@ -198,7 +215,7 @@ def main():
         test = pd.read_csv(args.data_dir / "test.csv")
         print("Extracting test EEG features...")
         X_test = build_features(test, args.data_dir / "test_eegs", is_train=False)
-        pred = align_probabilities(model, X_test)
+        pred = temperature_scale(align_probabilities(model, X_test), temps[best])
         submission = pd.DataFrame(pred, columns=TARGETS)
         submission.insert(0, "eeg_id", test["eeg_id"].to_numpy())
         submission.to_csv("submission.csv", index=False)
