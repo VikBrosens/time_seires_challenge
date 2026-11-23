@@ -11,6 +11,7 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+from joblib import Parallel, delayed
 import pandas as pd
 from scipy.signal import welch
 from scipy.stats import wilcoxon
@@ -23,9 +24,25 @@ from sklearn.model_selection import GroupKFold
 
 TARGETS = ["seizure_vote", "lpd_vote", "gpd_vote", "lrda_vote", "grda_vote", "other_vote"]
 FS = 200
-# A small, interpretable subset of EEG electrodes (not the EKG channel).
-CHANNELS = ["Fp1", "F7", "T3", "T5", "O1", "Fp2", "F8", "T4", "T6", "O2"]
-BANDS = [(0.5, 4), (4, 8), (8, 13), (13, 30)]
+# Step 9: the bipolar "double banana" montage that neurologists read: differences between
+# neighbouring electrodes along four chains (left/right lateral, left/right parasagittal).
+CHAINS = {
+    "LL": ["Fp1", "F7", "T3", "T5", "O1"],
+    "RL": ["Fp2", "F8", "T4", "T6", "O2"],
+    "LP": ["Fp1", "F3", "C3", "P3", "O1"],
+    "RP": ["Fp2", "F4", "C4", "P4", "O2"],
+}
+PAIRS = [(chain[k], chain[k + 1]) for chain in CHAINS.values() for k in range(4)]
+BANDS = [(0.5, 2), (2, 4), (4, 8), (8, 13), (13, 20), (20, 30)]
+FEATURE_VERSION = "v9"
+
+
+def clean(x):
+    """Replace missing samples by the channel median and clip extreme artefacts."""
+    if not np.isfinite(x).any():
+        return np.zeros_like(x)
+    x = np.where(np.isfinite(x), x, np.nanmedian(x[np.isfinite(x)]))
+    return np.clip(x, -1000, 1000)
 
 
 def extract_features(eeg_path, offset_seconds=0.0):
@@ -35,41 +52,34 @@ def extract_features(eeg_path, offset_seconds=0.0):
     concern its central 10 s. Test EEG files are exactly 50 s long.
     """
     frame = pd.read_parquet(eeg_path)
-    channels = [c for c in CHANNELS if c in frame.columns]
-    if not channels:
-        raise ValueError(f"No expected EEG channels in {eeg_path}")
-
     start = int(round((float(offset_seconds) + 20.0) * FS))
     end = start + 10 * FS
     if end > len(frame):
         raise ValueError(f"EEG window outside file: {eeg_path}, offset={offset_seconds}")
-    segment = frame.iloc[start:end][channels].to_numpy(dtype=np.float64)
+    segment = frame.iloc[start:end]
+    raw = {c: clean(segment[c].to_numpy(dtype=np.float64)) for c in {e for p in PAIRS for e in p}}
 
-    features = []
-    for j in range(len(channels)):
-        x = segment[:, j]
-        if not np.isfinite(x).any():
-            x = np.zeros_like(x)
-        else:
-            fill = np.nanmedian(x[np.isfinite(x)])
-            x = np.where(np.isfinite(x), x, fill)
-        x = np.clip(x, -1000, 1000)
-        features.extend([np.mean(x), np.std(x), np.ptp(x)])
-        frequencies, psd = welch(x, fs=FS, nperseg=min(512, len(x)))
-        for low, high in BANDS:
-            mask = (frequencies >= low) & (frequencies < high)
-            features.append(np.log1p(np.sum(psd[mask])))
+    features, log_power = [], []
+    for a, b in PAIRS:
+        x = raw[a] - raw[b]
+        frequencies, psd = welch(x, fs=FS, nperseg=400)
+        power = np.array([psd[(frequencies >= lo) & (frequencies < hi)].sum() for lo, hi in BANDS])
+        features.extend([np.std(x), np.ptp(x), np.mean(np.abs(np.diff(x)))])  # amplitude + "line length"
+        features.extend(np.log1p(power))                      # absolute band power
+        features.extend(power / (power.sum() + 1e-12))        # relative band power
+        log_power.append(np.log1p(power))
+    log_power = np.array(log_power).reshape(len(CHAINS), 4, len(BANDS)).mean(axis=1)  # per chain
+    features.extend(log_power[0] - log_power[1])  # left - right, lateral chains
+    features.extend(log_power[2] - log_power[3])  # left - right, parasagittal chains
     return np.asarray(features, dtype=np.float32)
 
 
 def build_features(metadata, eeg_folder, is_train=True):
-    X = []
-    for i, row in enumerate(metadata.itertuples(index=False)):
-        eeg_path = eeg_folder / f"{row.eeg_id}.parquet"
-        offset = row.eeg_label_offset_seconds if is_train else 0.0
-        X.append(extract_features(eeg_path, offset))
-        if (i + 1) % 200 == 0:
-            print(f"  Extracted {i + 1}/{len(metadata)} recordings")
+    """Step 9: extract the features of all EEGs in parallel on all CPU cores."""
+    paths = [eeg_folder / f"{eeg_id}.parquet" for eeg_id in metadata["eeg_id"]]
+    offsets = metadata["eeg_label_offset_seconds"].to_numpy() if is_train else np.zeros(len(metadata))
+    X = Parallel(n_jobs=-1, batch_size=32, verbose=2)(
+        delayed(extract_features)(p, o) for p, o in zip(paths, offsets))
     return np.vstack(X)
 
 
@@ -199,7 +209,7 @@ def main():
     print(f"EEGs with >= 10 votes: {high_quality.sum()} of {len(n_votes)}")
 
     # Step 1: feature extraction is slow on all EEGs, so save the features once and reuse them.
-    cache = Path(f"train_features_{len(train)}.npy")
+    cache = Path(f"train_features_{FEATURE_VERSION}_{len(train)}.npy")
     if cache.exists():
         print(f"Loading cached training features from {cache}")
         X = np.load(cache)
