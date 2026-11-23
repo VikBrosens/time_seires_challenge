@@ -18,7 +18,7 @@ from sklearn.metrics import accuracy_score, log_loss
 from sklearn.model_selection import GroupShuffleSplit
 
 TARGETS = ["seizure_vote", "lpd_vote", "gpd_vote", "lrda_vote", "grda_vote", "other_vote"]
-FS = 200
+FS = 200s
 # A small, interpretable subset of EEG electrodes (not the EKG channel).
 CHANNELS = ["Fp1", "F7", "T3", "T5", "O1", "Fp2", "F8", "T4", "T6", "O2"]
 BANDS = [(0.5, 4), (4, 8), (8, 13), (13, 30)]
@@ -76,6 +76,19 @@ def align_probabilities(model, X, n_classes=6):
     return np.clip(p, 1e-8, None) / np.clip(p, 1e-8, None).sum(axis=1, keepdims=True)
 
 
+def expand_soft(X, soft):
+    """Step 2: repeat each EEG once per class, weighted by that class's vote fraction.
+
+    Maximising the weighted log-likelihood of these rows is the same as minimising
+    the cross-entropy to the vote distribution, i.e. the KL divergence up to a constant.
+    """
+    X_rep = np.repeat(X, soft.shape[1], axis=0)
+    y_rep = np.tile(np.arange(soft.shape[1]), len(X))
+    w_rep = soft.reshape(-1)
+    keep = w_rep > 0
+    return X_rep[keep], y_rep[keep], w_rep[keep]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path, default=Path("/kaggle/input/hms-harmful-brain-activity-classification"))
@@ -89,7 +102,7 @@ def main():
     if args.max_train > 0 and len(train) > args.max_train:
         train = train.sample(n=args.max_train, random_state=42).reset_index(drop=True)
 
-    # Soft targets are the normalized expert votes; the simple RF fits hard labels.
+    # Soft targets are the normalized expert votes; the model is trained on them (step 2).
     votes = train[TARGETS].to_numpy(dtype=float)
     soft_targets = votes / votes.sum(axis=1, keepdims=True)
     hard_targets = np.argmax(soft_targets, axis=1)
@@ -111,7 +124,8 @@ def main():
     model = RandomForestClassifier(
         n_estimators=150, min_samples_leaf=2, random_state=42, n_jobs=-1
     )
-    model.fit(X[idx_train], hard_targets[idx_train])
+    Xr, yr, wr = expand_soft(X[idx_train], soft_targets[idx_train])
+    model.fit(Xr, yr, sample_weight=wr)
     val_prob = align_probabilities(model, X[idx_val])
     val_pred = np.argmax(val_prob, axis=1)
     print(f"Validation accuracy (consensus/majority class): {accuracy_score(hard_targets[idx_val], val_pred):.4f}")
@@ -123,7 +137,8 @@ def main():
 
     if args.submission:
         print("Refitting on all selected training recordings...")
-        model.fit(X, hard_targets)
+        Xr, yr, wr = expand_soft(X, soft_targets)
+        model.fit(Xr, yr, sample_weight=wr)
         test = pd.read_csv(args.data_dir / "test.csv")
         print("Extracting test EEG features...")
         X_test = build_features(test, args.data_dir / "test_eegs", is_train=False)
