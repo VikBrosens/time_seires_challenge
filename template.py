@@ -16,7 +16,7 @@ from joblib import Parallel, delayed
 import pandas as pd
 from scipy.optimize import minimize
 from scipy.signal import welch
-from scipy.stats import wilcoxon
+from scipy.stats import kurtosis, skew, wilcoxon
 from sklearn.decomposition import PCA
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
@@ -36,7 +36,7 @@ CHAINS = {
 }
 PAIRS = [(chain[k], chain[k + 1]) for chain in CHAINS.values() for k in range(4)]
 BANDS = [(0.5, 2), (2, 4), (4, 8), (8, 13), (13, 20), (20, 30)]
-FEATURE_VERSION = "v9"
+FEATURE_VERSION = "v13"
 
 
 def clean(x):
@@ -69,11 +69,30 @@ def extract_features(eeg_path, offset_seconds=0.0):
         features.extend([np.std(x), np.ptp(x), np.mean(np.abs(np.diff(x)))])  # amplitude + "line length"
         features.extend(np.log1p(power))                      # absolute band power
         features.extend(power / (power.sum() + 1e-12))        # relative band power
+        # Step 13: Hjorth parameters (signal "frequency" and "shape"), spectral entropy
+        # (rhythmic signal = low entropy) and the shape of the amplitude distribution.
+        dx, ddx = np.diff(x), np.diff(x, n=2)
+        mobility = np.sqrt(dx.var() / (x.var() + 1e-12))
+        complexity = np.sqrt(ddx.var() / (dx.var() + 1e-12)) / (mobility + 1e-12)
+        p = psd[(frequencies >= 0.5) & (frequencies < 30)]
+        p = p / (p.sum() + 1e-12)
+        entropy = -np.sum(p * np.log(p + 1e-12)) / np.log(len(p))
+        features.extend([mobility, complexity, entropy, skew(x), kurtosis(x)])
         log_power.append(np.log1p(power))
     log_power = np.array(log_power).reshape(len(CHAINS), 4, len(BANDS)).mean(axis=1)  # per chain
     features.extend(log_power[0] - log_power[1])  # left - right, lateral chains
     features.extend(log_power[2] - log_power[3])  # left - right, parasagittal chains
-    return np.asarray(features, dtype=np.float32)
+
+    # Step 13: context: band power per chain over the whole 50 s segment, not only the central 10 s.
+    start50 = int(round(float(offset_seconds) * FS))
+    full = frame.iloc[start50:start50 + 50 * FS]
+    raw50 = {c: clean(full[c].to_numpy(dtype=np.float64)) for c in raw}
+    context = []
+    for a, b in PAIRS:
+        frequencies, psd = welch(raw50[a] - raw50[b], fs=FS, nperseg=400)
+        context.append(np.log1p([psd[(frequencies >= lo) & (frequencies < hi)].sum() for lo, hi in BANDS]))
+    features.extend(np.array(context).reshape(len(CHAINS), 4, len(BANDS)).mean(axis=1).ravel())
+    return np.nan_to_num(np.asarray(features, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def build_features(metadata, eeg_folder, is_train=True):
