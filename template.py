@@ -105,31 +105,40 @@ def build_features(metadata, eeg_folder, is_train=True):
 
 
 SPEC_REGIONS = ["LL", "RL", "LP", "RP"]
-SPEC_BANDS = [(0.5, 4), (4, 8), (8, 13), (13, 20)]
+SPEC_BANDS = [(0.5, 2), (2, 4), (4, 6), (6, 8), (8, 10), (10, 13), (13, 16), (16, 20)]
+SPEC_VERSION = "v14"
 
 
 def extract_spec_features(spec_path, offset_seconds=0.0):
-    """Step 10: features from the 10-minute Kaggle spectrogram around the labelled segment.
+    """Step 14: features from the 10-minute Kaggle spectrogram around the labelled segment.
 
     Spectrogram columns are named like 'LL_1.17' (region_frequency in Hz), one row per 2 s.
-    We take log band power per region over the whole 10 min and over the central 60 s.
+    Per region and band: mean, std, 10th and 90th percentile of the log power over the
+    10 min, plus the mean over the central 60 s; then left-right differences of the latter.
     """
     spec = pd.read_parquet(spec_path)
     t = spec["time"].to_numpy()
-    window = spec[(t >= offset_seconds) & (t <= offset_seconds + 600)]
-    centre = spec[(t >= offset_seconds + 270) & (t <= offset_seconds + 330)]
-    features = []
+    in_window = (t >= offset_seconds) & (t <= offset_seconds + 600)
+    in_centre = (t >= offset_seconds + 270) & (t <= offset_seconds + 330)
+    features, centre_means = [], []
     for region in SPEC_REGIONS:
         cols = [c for c in spec.columns if c.startswith(region + "_")]
         freqs = np.array([float(c.split("_")[1]) for c in cols])
+        values = np.log1p(np.clip(spec[cols].to_numpy(dtype=np.float64), 0, None))
+        region_centre = []
         for lo, hi in SPEC_BANDS:
-            band_cols = [c for c, f in zip(cols, freqs) if lo <= f < hi]
-            for part in (window, centre):
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN time points are filtered below
-                    values = np.nanmean(np.log1p(np.clip(part[band_cols].to_numpy(dtype=np.float64), 0, None)), axis=1)
-                values = values[np.isfinite(values)]
-                features.extend([values.mean(), values.std()] if len(values) else [0.0, 0.0])
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN time points are filtered below
+                series = np.nanmean(values[:, (freqs >= lo) & (freqs < hi)], axis=1)
+            w = series[in_window & np.isfinite(series)]
+            c = series[in_centre & np.isfinite(series)]
+            features.extend([w.mean(), w.std(), np.percentile(w, 10), np.percentile(w, 90)] if len(w) else [0.0] * 4)
+            region_centre.append(c.mean() if len(c) else 0.0)
+        features.extend(region_centre)
+        centre_means.append(region_centre)
+    centre_means = np.array(centre_means)
+    features.extend(centre_means[0] - centre_means[1])  # LL - RL
+    features.extend(centre_means[2] - centre_means[3])  # LP - RP
     return np.asarray(features, dtype=np.float32)
 
 
@@ -296,7 +305,7 @@ def main():
         X = build_features(train, args.data_dir / "train_eegs", is_train=True)
         np.save(cache, X)
     # Step 10: add the spectrogram features (cached separately).
-    spec_cache = Path(f"train_spec_features_{len(train)}.npy")
+    spec_cache = Path(f"train_spec_features_{SPEC_VERSION}_{len(train)}.npy")
     if spec_cache.exists():
         print(f"Loading cached spectrogram features from {spec_cache}")
         X_spec = np.load(spec_cache)
