@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 from joblib import Parallel, delayed
 import pandas as pd
+from scipy.optimize import minimize
 from scipy.signal import welch
 from scipy.stats import wilcoxon
 from sklearn.decomposition import PCA
@@ -135,7 +136,6 @@ def kl_per_eeg(soft, prob):
 
 
 MODELS = ["rf", "pca_logreg", "hgb", "hgb_slow"]
-ENSEMBLE = ("rf", "hgb")  # step 7: average of the two tree models
 
 
 def make_model(name):
@@ -192,6 +192,21 @@ def fit_temperature(soft, prob, grid=np.linspace(0.5, 5.0, 46)):
     maximum-likelihood fit on validation predictions)."""
     kls = [kl_per_eeg(soft, temperature_scale(prob, T)).mean() for T in grid]
     return float(grid[int(np.argmin(kls))])
+
+
+def fit_blend_weights(soft, probs):
+    """Step 12: weights (positive, summing to 1) for averaging the models' predictions,
+    chosen by minimising the out-of-fold KL."""
+    probs = np.asarray(probs)
+
+    def loss(z):
+        w = np.exp(z - z.max())
+        w /= w.sum()
+        return kl_per_eeg(soft, np.tensordot(w, probs, axes=1)).mean()
+
+    res = minimize(loss, np.zeros(len(probs)), method="Nelder-Mead", options={"maxiter": 2000})
+    w = np.exp(res.x - res.x.max())
+    return w / w.sum()
 
 
 def bootstrap_ci(values, q=1000, alpha=0.05, seed=42):
@@ -287,13 +302,15 @@ def main():
         oof[name] = temperature_scale(oof[name], temps[name])
         cv_kl[name] = kl_per_eeg(soft_targets, oof[name]).mean()
         print(f"  after temperature scaling (T={temps[name]:.2f}): {cv_kl[name]:.4f}")
-    # Step 7: ensemble = average of the (calibrated) predictions of the tree models.
+    # Step 12: ensemble = weighted average of the calibrated predictions of all models.
     name = "ensemble"
-    avg = np.mean([oof[m] for m in ENSEMBLE], axis=0)
+    blend_w = dict(zip(MODELS, fit_blend_weights(soft_targets, [oof[m] for m in MODELS])))
+    print("Ensemble weights: " + ", ".join(f"{m} {w:.2f}" for m, w in blend_w.items()))
+    avg = sum(blend_w[m] * oof[m] for m in MODELS)
     temps[name] = fit_temperature(soft_targets, avg)
     oof[name] = temperature_scale(avg, temps[name])
     cv_kl[name] = kl_per_eeg(soft_targets, oof[name]).mean()
-    print(f"CV KL divergence ensemble {'+'.join(ENSEMBLE)} (T={temps[name]:.2f}): {cv_kl[name]:.4f}")
+    print(f"CV KL divergence weighted ensemble (T={temps[name]:.2f}): {cv_kl[name]:.4f}")
     best = min(cv_kl, key=cv_kl.get)
     print(f"Best model on CV: {best}")
     for name in oof:
@@ -312,7 +329,11 @@ def main():
         print(f"Wilcoxon {best} vs {name}: p={p:.3g}, Holm-adjusted p={p_adj:.3g}")
 
     if args.submission:
-        members = ENSEMBLE if best == "ensemble" else (best,)
+        if best == "ensemble":
+            members = [m for m in MODELS if blend_w[m] > 0.01]  # skip models with (almost) no weight
+            member_w = np.array([blend_w[m] for m in members]) / sum(blend_w[m] for m in members)
+        else:
+            members, member_w = [best], np.array([1.0])
         test = pd.read_csv(args.data_dir / "test.csv")
         print("Extracting test EEG features...")
         X_test = build_features(test, args.data_dir / "test_eegs", is_train=False)
@@ -324,7 +345,7 @@ def main():
             p_m = align_probabilities(model, X_test)
             # ensemble members are calibrated one by one, exactly as in cross-validation
             preds.append(temperature_scale(p_m, temps[m]) if best == "ensemble" else p_m)
-        pred = temperature_scale(np.mean(preds, axis=0), temps[best])
+        pred = temperature_scale(np.tensordot(member_w, np.asarray(preds), axes=1), temps[best])
         submission = pd.DataFrame(pred, columns=TARGETS)
         submission.insert(0, "eeg_id", test["eeg_id"].to_numpy())
         submission.to_csv("submission.csv", index=False)
