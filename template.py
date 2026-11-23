@@ -105,9 +105,9 @@ def make_model(name):
     raise ValueError(name)
 
 
-def fit_soft(model, X, soft):
+def fit_soft(model, X, soft, weight=None):
     """Fit on soft labels; a pipeline needs the weights routed to its last step."""
-    Xr, yr, wr = expand_soft(X, soft)
+    Xr, yr, wr = expand_soft(X, soft, weight)
     if hasattr(model, "steps"):
         model.fit(Xr, yr, **{f"{model.steps[-1][0]}__sample_weight": wr})
     else:
@@ -115,12 +115,12 @@ def fit_soft(model, X, soft):
     return model
 
 
-def cross_validate(name, X, soft, groups, n_splits=5):
+def cross_validate(name, X, soft, groups, weight=None, n_splits=5):
     """Step 3: out-of-fold predictions with GroupKFold, so every EEG is validated once
     and no patient is in both the training and the validation part of a fold."""
     oof = np.zeros_like(soft)
     for fold, (tr, va) in enumerate(GroupKFold(n_splits=n_splits).split(X, groups=groups)):
-        model = fit_soft(make_model(name), X[tr], soft[tr])
+        model = fit_soft(make_model(name), X[tr], soft[tr], None if weight is None else weight[tr])
         oof[va] = align_probabilities(model, X[va])
         print(f"  fold {fold + 1}/{n_splits}: KL {kl_per_eeg(soft[va], oof[va]).mean():.4f}")
     return oof
@@ -160,7 +160,7 @@ def holm(pvalues):
     return adjusted
 
 
-def expand_soft(X, soft):
+def expand_soft(X, soft, weight=None):
     """Step 2: repeat each EEG once per class, weighted by that class's vote fraction.
 
     Maximising the weighted log-likelihood of these rows is the same as minimising
@@ -169,6 +169,8 @@ def expand_soft(X, soft):
     X_rep = np.repeat(X, soft.shape[1], axis=0)
     y_rep = np.tile(np.arange(soft.shape[1]), len(X))
     w_rep = soft.reshape(-1)
+    if weight is not None:  # step 8: per-EEG weight (number of votes)
+        w_rep = w_rep * np.repeat(weight, soft.shape[1])
     keep = w_rep > 0
     return X_rep[keep], y_rep[keep], w_rep[keep]
 
@@ -189,6 +191,12 @@ def main():
     # Soft targets are the normalized expert votes; the model is trained on them (step 2).
     votes = train[TARGETS].to_numpy(dtype=float)
     soft_targets = votes / votes.sum(axis=1, keepdims=True)
+    # Step 8: an EEG judged by many experts has a more reliable label than one judged by 1-2.
+    # Weight each EEG by its number of votes, capped at 10 (weight 0.1 ... 1.0).
+    n_votes = votes.sum(axis=1)
+    eeg_weight = np.minimum(n_votes, 10) / 10
+    high_quality = n_votes >= 10
+    print(f"EEGs with >= 10 votes: {high_quality.sum()} of {len(n_votes)}")
 
     # Step 1: feature extraction is slow on all EEGs, so save the features once and reuse them.
     cache = Path(f"train_features_{len(train)}.npy")
@@ -208,7 +216,7 @@ def main():
     oof, cv_kl, temps = {}, {}, {}
     for name in MODELS:
         print(f"5-fold GroupKFold cross-validation of {name} (grouped by patient)...")
-        oof[name] = cross_validate(name, X, soft_targets, groups)
+        oof[name] = cross_validate(name, X, soft_targets, groups, eeg_weight)
         print(f"CV KL divergence {name}: {kl_per_eeg(soft_targets, oof[name]).mean():.4f}")
         temps[name] = fit_temperature(soft_targets, oof[name])
         oof[name] = temperature_scale(oof[name], temps[name])
@@ -223,6 +231,8 @@ def main():
     print(f"CV KL divergence ensemble {'+'.join(ENSEMBLE)} (T={temps[name]:.2f}): {cv_kl[name]:.4f}")
     best = min(cv_kl, key=cv_kl.get)
     print(f"Best model on CV: {best}")
+    for name in oof:
+        print(f"  {name}: KL on EEGs with >= 10 votes: {kl_per_eeg(soft_targets[high_quality], oof[name][high_quality]).mean():.4f}")
 
     # Step 5: how certain are these numbers, and is the difference between the models real?
     per_eeg = {name: kl_per_eeg(soft_targets, oof[name]) for name in oof}
@@ -244,7 +254,7 @@ def main():
         preds = []
         for m in members:
             print(f"Refitting {m} on all selected training recordings...")
-            model = fit_soft(make_model(m), X, soft_targets)
+            model = fit_soft(make_model(m), X, soft_targets, eeg_weight)
             p_m = align_probabilities(model, X_test)
             # ensemble members are calibrated one by one, exactly as in cross-validation
             preds.append(temperature_scale(p_m, temps[m]) if best == "ensemble" else p_m)
