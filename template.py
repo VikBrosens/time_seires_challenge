@@ -15,7 +15,7 @@ import pandas as pd
 from scipy.signal import welch
 from scipy.stats import wilcoxon
 from sklearn.decomposition import PCA
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -86,12 +86,17 @@ def kl_per_eeg(soft, prob):
     return np.sum(y * (np.log(y) - np.log(prob)), axis=1)
 
 
-MODELS = ["rf", "pca_logreg"]
+MODELS = ["rf", "pca_logreg", "hgb"]
+ENSEMBLE = ("rf", "hgb")  # step 7: average of the two tree models
 
 
 def make_model(name):
     if name == "rf":
         return RandomForestClassifier(n_estimators=150, min_samples_leaf=2, random_state=42, n_jobs=-1)
+    if name == "hgb":
+        # Step 7: gradient boosting builds trees one after another, each correcting the previous ones.
+        return HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, max_leaf_nodes=31,
+                                              l2_regularization=1.0, random_state=42)
     if name == "pca_logreg":
         # Step 4: standardise (features have very different units), keep the principal
         # components that explain 95% of the variance, then multinomial logistic regression.
@@ -141,6 +146,18 @@ def bootstrap_ci(values, q=1000, alpha=0.05, seed=42):
     n = len(values)
     means = np.array([values[rng.integers(0, n, n)].mean() for _ in range(q)])
     return np.quantile(means, [alpha / 2, 1 - alpha / 2]), means.std(ddof=1)
+
+
+def holm(pvalues):
+    """Step 7: Holm-Bonferroni adjusted p-values (controls the family-wise error rate)."""
+    p = np.asarray(pvalues, dtype=float)
+    order = np.argsort(p)
+    adjusted = np.empty_like(p)
+    running = 0.0
+    for rank, i in enumerate(order):
+        running = max(running, min(1.0, (len(p) - rank) * p[i]))
+        adjusted[i] = running
+    return adjusted
 
 
 def expand_soft(X, soft):
@@ -197,25 +214,41 @@ def main():
         oof[name] = temperature_scale(oof[name], temps[name])
         cv_kl[name] = kl_per_eeg(soft_targets, oof[name]).mean()
         print(f"  after temperature scaling (T={temps[name]:.2f}): {cv_kl[name]:.4f}")
+    # Step 7: ensemble = average of the (calibrated) predictions of the tree models.
+    name = "ensemble"
+    avg = np.mean([oof[m] for m in ENSEMBLE], axis=0)
+    temps[name] = fit_temperature(soft_targets, avg)
+    oof[name] = temperature_scale(avg, temps[name])
+    cv_kl[name] = kl_per_eeg(soft_targets, oof[name]).mean()
+    print(f"CV KL divergence ensemble {'+'.join(ENSEMBLE)} (T={temps[name]:.2f}): {cv_kl[name]:.4f}")
     best = min(cv_kl, key=cv_kl.get)
     print(f"Best model on CV: {best}")
 
     # Step 5: how certain are these numbers, and is the difference between the models real?
-    per_eeg = {name: kl_per_eeg(soft_targets, oof[name]) for name in MODELS}
-    for name in MODELS:
+    per_eeg = {name: kl_per_eeg(soft_targets, oof[name]) for name in oof}
+    for name in oof:
         (low, high), se = bootstrap_ci(per_eeg[name])
         print(f"{name}: KL {per_eeg[name].mean():.4f}, bootstrap 95% CI [{low:.4f}, {high:.4f}], SE {se:.4f}")
-    # Paired test: both models are evaluated on the same EEGs; KL values are not normal.
-    stat, p = wilcoxon(per_eeg[MODELS[0]], per_eeg[MODELS[1]])
-    print(f"Wilcoxon signed-rank test {MODELS[0]} vs {MODELS[1]}: T={stat:.1f}, p={p:.3g}")
+    # Paired Wilcoxon test of the best model against every other model. Several tests at
+    # once -> Holm-Bonferroni correction for multiple testing (step 7).
+    others = [name for name in oof if name != best]
+    raw_p = [wilcoxon(per_eeg[best], per_eeg[name]).pvalue for name in others]
+    for name, p, p_adj in zip(others, raw_p, holm(raw_p)):
+        print(f"Wilcoxon {best} vs {name}: p={p:.3g}, Holm-adjusted p={p_adj:.3g}")
 
     if args.submission:
-        print(f"Refitting {best} on all selected training recordings...")
-        model = fit_soft(make_model(best), X, soft_targets)
+        members = ENSEMBLE if best == "ensemble" else (best,)
         test = pd.read_csv(args.data_dir / "test.csv")
         print("Extracting test EEG features...")
         X_test = build_features(test, args.data_dir / "test_eegs", is_train=False)
-        pred = temperature_scale(align_probabilities(model, X_test), temps[best])
+        preds = []
+        for m in members:
+            print(f"Refitting {m} on all selected training recordings...")
+            model = fit_soft(make_model(m), X, soft_targets)
+            p_m = align_probabilities(model, X_test)
+            # ensemble members are calibrated one by one, exactly as in cross-validation
+            preds.append(temperature_scale(p_m, temps[m]) if best == "ensemble" else p_m)
+        pred = temperature_scale(np.mean(preds, axis=0), temps[best])
         submission = pd.DataFrame(pred, columns=TARGETS)
         submission.insert(0, "eeg_id", test["eeg_id"].to_numpy())
         submission.to_csv("submission.csv", index=False)
