@@ -13,7 +13,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.signal import welch
+from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import GroupKFold
 
 TARGETS = ["seizure_vote", "lpd_vote", "gpd_vote", "lrda_vote", "grda_vote", "other_vote"]
@@ -81,18 +85,36 @@ def kl_per_eeg(soft, prob):
     return np.sum(y * (np.log(y) - np.log(prob)), axis=1)
 
 
-def make_model():
-    return RandomForestClassifier(n_estimators=150, min_samples_leaf=2, random_state=42, n_jobs=-1)
+MODELS = ["rf", "pca_logreg"]
 
 
-def cross_validate(X, soft, groups, n_splits=5):
+def make_model(name):
+    if name == "rf":
+        return RandomForestClassifier(n_estimators=150, min_samples_leaf=2, random_state=42, n_jobs=-1)
+    if name == "pca_logreg":
+        # Step 4: standardise (features have very different units), keep the principal
+        # components that explain 95% of the variance, then multinomial logistic regression.
+        return make_pipeline(StandardScaler(), PCA(n_components=0.95, svd_solver="full"),
+                             LogisticRegression(C=1.0, max_iter=2000))
+    raise ValueError(name)
+
+
+def fit_soft(model, X, soft):
+    """Fit on soft labels; a pipeline needs the weights routed to its last step."""
+    Xr, yr, wr = expand_soft(X, soft)
+    if hasattr(model, "steps"):
+        model.fit(Xr, yr, **{f"{model.steps[-1][0]}__sample_weight": wr})
+    else:
+        model.fit(Xr, yr, sample_weight=wr)
+    return model
+
+
+def cross_validate(name, X, soft, groups, n_splits=5):
     """Step 3: out-of-fold predictions with GroupKFold, so every EEG is validated once
     and no patient is in both the training and the validation part of a fold."""
     oof = np.zeros_like(soft)
     for fold, (tr, va) in enumerate(GroupKFold(n_splits=n_splits).split(X, groups=groups)):
-        model = make_model()
-        Xr, yr, wr = expand_soft(X[tr], soft[tr])
-        model.fit(Xr, yr, sample_weight=wr)
+        model = fit_soft(make_model(name), X[tr], soft[tr])
         oof[va] = align_probabilities(model, X[va])
         print(f"  fold {fold + 1}/{n_splits}: KL {kl_per_eeg(soft[va], oof[va]).mean():.4f}")
     return oof
@@ -142,15 +164,19 @@ def main():
     prior = np.tile(soft_targets.mean(axis=0), (len(soft_targets), 1))
     print(f"Reference KL (always predict the mean vote distribution): {kl_per_eeg(soft_targets, prior).mean():.4f}")
 
-    print("5-fold GroupKFold cross-validation (grouped by patient)...")
-    oof = cross_validate(X, soft_targets, train["patient_id"].to_numpy())
-    print(f"CV KL divergence (soft expert votes): {kl_per_eeg(soft_targets, oof).mean():.4f}")
+    groups = train["patient_id"].to_numpy()
+    oof, cv_kl = {}, {}
+    for name in MODELS:
+        print(f"5-fold GroupKFold cross-validation of {name} (grouped by patient)...")
+        oof[name] = cross_validate(name, X, soft_targets, groups)
+        cv_kl[name] = kl_per_eeg(soft_targets, oof[name]).mean()
+        print(f"CV KL divergence {name}: {cv_kl[name]:.4f}")
+    best = min(cv_kl, key=cv_kl.get)
+    print(f"Best model on CV: {best}")
 
     if args.submission:
-        print("Refitting on all selected training recordings...")
-        model = make_model()
-        Xr, yr, wr = expand_soft(X, soft_targets)
-        model.fit(Xr, yr, sample_weight=wr)
+        print(f"Refitting {best} on all selected training recordings...")
+        model = fit_soft(make_model(best), X, soft_targets)
         test = pd.read_csv(args.data_dir / "test.csv")
         print("Extracting test EEG features...")
         X_test = build_features(test, args.data_dir / "test_eegs", is_train=False)
