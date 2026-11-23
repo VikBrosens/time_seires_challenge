@@ -8,6 +8,7 @@ Requires: numpy, pandas, scipy, scikit-learn, pyarrow.
 This is a teaching baseline, not a competitive Kaggle solution.
 """
 import argparse
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -104,7 +105,9 @@ def extract_spec_features(spec_path, offset_seconds=0.0):
         for lo, hi in SPEC_BANDS:
             band_cols = [c for c, f in zip(cols, freqs) if lo <= f < hi]
             for part in (window, centre):
-                values = np.nanmean(np.log1p(np.clip(part[band_cols].to_numpy(dtype=np.float64), 0, None)), axis=1)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN time points are filtered below
+                    values = np.nanmean(np.log1p(np.clip(part[band_cols].to_numpy(dtype=np.float64), 0, None)), axis=1)
                 values = values[np.isfinite(values)]
                 features.extend([values.mean(), values.std()] if len(values) else [0.0, 0.0])
     return np.asarray(features, dtype=np.float32)
@@ -131,7 +134,7 @@ def kl_per_eeg(soft, prob):
     return np.sum(y * (np.log(y) - np.log(prob)), axis=1)
 
 
-MODELS = ["rf", "pca_logreg", "hgb"]
+MODELS = ["rf", "pca_logreg", "hgb", "hgb_slow"]
 ENSEMBLE = ("rf", "hgb")  # step 7: average of the two tree models
 
 
@@ -142,6 +145,12 @@ def make_model(name):
         # Step 7: gradient boosting builds trees one after another, each correcting the previous ones.
         return HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, max_leaf_nodes=31,
                                               l2_regularization=1.0, random_state=42)
+    if name == "hgb_slow":
+        # Step 11: smaller learning rate with more trees, bigger leaves and a random half of the
+        # features per split: each tree learns less, which reduces overfitting (bias-variance).
+        return HistGradientBoostingClassifier(max_iter=600, learning_rate=0.03, max_leaf_nodes=31,
+                                              min_samples_leaf=40, max_features=0.5, l2_regularization=1.0,
+                                              early_stopping=False, random_state=42)
     if name == "pca_logreg":
         # Step 4: standardise (features have very different units), keep the principal
         # components that explain 95% of the variance, then multinomial logistic regression.
