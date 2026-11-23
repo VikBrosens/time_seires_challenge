@@ -14,11 +14,10 @@ import numpy as np
 import pandas as pd
 from scipy.signal import welch
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, log_loss
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.model_selection import GroupKFold
 
 TARGETS = ["seizure_vote", "lpd_vote", "gpd_vote", "lrda_vote", "grda_vote", "other_vote"]
-FS = 200s
+FS = 200
 # A small, interpretable subset of EEG electrodes (not the EKG channel).
 CHANNELS = ["Fp1", "F7", "T3", "T5", "O1", "Fp2", "F8", "T4", "T6", "O2"]
 BANDS = [(0.5, 4), (4, 8), (8, 13), (13, 30)]
@@ -76,6 +75,29 @@ def align_probabilities(model, X, n_classes=6):
     return np.clip(p, 1e-8, None) / np.clip(p, 1e-8, None).sum(axis=1, keepdims=True)
 
 
+def kl_per_eeg(soft, prob):
+    """KL divergence between expert votes and prediction, one value per EEG."""
+    y = np.clip(soft, 1e-12, 1.0)
+    return np.sum(y * (np.log(y) - np.log(prob)), axis=1)
+
+
+def make_model():
+    return RandomForestClassifier(n_estimators=150, min_samples_leaf=2, random_state=42, n_jobs=-1)
+
+
+def cross_validate(X, soft, groups, n_splits=5):
+    """Step 3: out-of-fold predictions with GroupKFold, so every EEG is validated once
+    and no patient is in both the training and the validation part of a fold."""
+    oof = np.zeros_like(soft)
+    for fold, (tr, va) in enumerate(GroupKFold(n_splits=n_splits).split(X, groups=groups)):
+        model = make_model()
+        Xr, yr, wr = expand_soft(X[tr], soft[tr])
+        model.fit(Xr, yr, sample_weight=wr)
+        oof[va] = align_probabilities(model, X[va])
+        print(f"  fold {fold + 1}/{n_splits}: KL {kl_per_eeg(soft[va], oof[va]).mean():.4f}")
+    return oof
+
+
 def expand_soft(X, soft):
     """Step 2: repeat each EEG once per class, weighted by that class's vote fraction.
 
@@ -105,7 +127,6 @@ def main():
     # Soft targets are the normalized expert votes; the model is trained on them (step 2).
     votes = train[TARGETS].to_numpy(dtype=float)
     soft_targets = votes / votes.sum(axis=1, keepdims=True)
-    hard_targets = np.argmax(soft_targets, axis=1)
 
     # Step 1: feature extraction is slow on all EEGs, so save the features once and reuse them.
     cache = Path(f"train_features_{len(train)}.npy")
@@ -117,26 +138,17 @@ def main():
         X = build_features(train, args.data_dir / "train_eegs", is_train=True)
         np.save(cache, X)
 
-    # Split by patient, not EEG window, to prevent patient-level leakage.
-    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    idx_train, idx_val = next(splitter.split(X, hard_targets, groups=train["patient_id"]))
+    # Reference: always predict the average vote distribution (no EEG information).
+    prior = np.tile(soft_targets.mean(axis=0), (len(soft_targets), 1))
+    print(f"Reference KL (always predict the mean vote distribution): {kl_per_eeg(soft_targets, prior).mean():.4f}")
 
-    model = RandomForestClassifier(
-        n_estimators=150, min_samples_leaf=2, random_state=42, n_jobs=-1
-    )
-    Xr, yr, wr = expand_soft(X[idx_train], soft_targets[idx_train])
-    model.fit(Xr, yr, sample_weight=wr)
-    val_prob = align_probabilities(model, X[idx_val])
-    val_pred = np.argmax(val_prob, axis=1)
-    print(f"Validation accuracy (consensus/majority class): {accuracy_score(hard_targets[idx_val], val_pred):.4f}")
-    print(f"Validation log loss (hard labels): {log_loss(hard_targets[idx_val], val_prob, labels=np.arange(6)):.4f}")
-    # Kaggle uses KL divergence between expert-vote distributions and predictions.
-    y_true = np.clip(soft_targets[idx_val], 1e-12, 1.0)
-    kl = np.mean(np.sum(y_true * (np.log(y_true) - np.log(val_prob)), axis=1))
-    print(f"Validation KL divergence (soft expert votes): {kl:.4f}")
+    print("5-fold GroupKFold cross-validation (grouped by patient)...")
+    oof = cross_validate(X, soft_targets, train["patient_id"].to_numpy())
+    print(f"CV KL divergence (soft expert votes): {kl_per_eeg(soft_targets, oof).mean():.4f}")
 
     if args.submission:
         print("Refitting on all selected training recordings...")
+        model = make_model()
         Xr, yr, wr = expand_soft(X, soft_targets)
         model.fit(Xr, yr, sample_weight=wr)
         test = pd.read_csv(args.data_dir / "test.csv")
