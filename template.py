@@ -1,3 +1,4 @@
+%%writefile hms_sklearn_starter.py
 """HMS EEG classification: simple scikit-learn teaching baseline.
 
 Run in a Kaggle notebook with the HMS competition dataset attached, or locally:
@@ -78,7 +79,7 @@ def align_probabilities(model, X, n_classes=6):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path, default=Path("/kaggle/input/hms-harmful-brain-activity-classification"))
-    parser.add_argument("--max-train", type=int, default=2000, help="Limit examples for a quick classroom run; 0 uses all rows")
+    parser.add_argument("--max-train", type=int, default=0, help="Limit examples for a quick classroom run; 0 uses all rows")
     parser.add_argument("--submission", action="store_true", help="Also predict the provided test EEGs")
     args = parser.parse_args()
 
@@ -93,8 +94,15 @@ def main():
     soft_targets = votes / votes.sum(axis=1, keepdims=True)
     hard_targets = np.argmax(soft_targets, axis=1)
 
-    print("Extracting training EEG features...")
-    X = build_features(train, args.data_dir / "train_eegs", is_train=True)
+    # Step 1: feature extraction is slow on all EEGs, so save the features once and reuse them.
+    cache = Path(f"train_features_{len(train)}.npy")
+    if cache.exists():
+        print(f"Loading cached training features from {cache}")
+        X = np.load(cache)
+    else:
+        print("Extracting training EEG features...")
+        X = build_features(train, args.data_dir / "train_eegs", is_train=True)
+        np.save(cache, X)
 
     # Split by patient, not EEG window, to prevent patient-level leakage.
     splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
