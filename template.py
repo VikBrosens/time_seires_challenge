@@ -163,8 +163,10 @@ def kl_per_eeg(soft, prob):
     return np.sum(y * (np.log(y) - np.log(prob)), axis=1)
 
 
-MODELS = ["rf", "pca_logreg", "hgb", "hgb_slow", "hgb_2stage"]
-STAGE2_ITER = 150
+# Step 16: rf, pca_logreg and hgb got (almost) no ensemble weight in step 15 -> dropped (faster).
+# Two two-stage variants: 150 or 300 extra trees on the EEGs with >= 10 votes.
+MODELS = ["hgb_slow", "hgb_2stage", "hgb_2stage_long"]
+STAGE2_ITER = {"hgb_2stage": 150, "hgb_2stage_long": 300}
 
 
 def make_model(name):
@@ -201,9 +203,9 @@ def fit_soft(model, X, soft, weight=None):
 def train_model(name, X, soft, weight, hq):
     """Step 15: 'hgb_2stage' first learns from all EEGs, then adds extra trees that are
     trained only on the EEGs with >= 10 votes (cleaner labels)."""
-    if name == "hgb_2stage":
+    if name in STAGE2_ITER:
         model = fit_soft(make_model("hgb_slow"), X, soft, weight)
-        model.set_params(warm_start=True, max_iter=model.max_iter + STAGE2_ITER)
+        model.set_params(warm_start=True, max_iter=model.max_iter + STAGE2_ITER[name])
         return fit_soft(model, X[hq], soft[hq], weight[hq])
     return fit_soft(make_model(name), X, soft, weight)
 
@@ -332,31 +334,35 @@ def main():
     print(f"Reference KL (always predict the mean vote distribution): {kl_per_eeg(soft_targets, prior).mean():.4f}")
 
     groups = train["patient_id"].to_numpy()
+    # Step 16: the Kaggle scores (step 15) were close to the CV KL on the EEGs with >= 10 votes,
+    # so the test set resembles those EEGs. Temperatures, ensemble weights and the choice of
+    # the best model are therefore tuned on that subset (all EEGs are still used for training).
+    hq = high_quality
     oof, cv_kl, temps = {}, {}, {}
     for name in MODELS:
         print(f"5-fold GroupKFold cross-validation of {name} (grouped by patient)...")
         oof[name] = cross_validate(name, X, soft_targets, groups, eeg_weight, high_quality)
-        print(f"CV KL divergence {name}: {kl_per_eeg(soft_targets, oof[name]).mean():.4f}")
-        temps[name] = fit_temperature(soft_targets, oof[name])
+        temps[name] = fit_temperature(soft_targets[hq], oof[name][hq])
         oof[name] = temperature_scale(oof[name], temps[name])
-        cv_kl[name] = kl_per_eeg(soft_targets, oof[name]).mean()
-        print(f"  after temperature scaling (T={temps[name]:.2f}): {cv_kl[name]:.4f}")
+        cv_kl[name] = kl_per_eeg(soft_targets[hq], oof[name][hq]).mean()
+        print(f"CV KL {name} (T={temps[name]:.2f}): EEGs with >= 10 votes {cv_kl[name]:.4f}, "
+              f"all EEGs {kl_per_eeg(soft_targets, oof[name]).mean():.4f}")
     # Step 12: ensemble = weighted average of the calibrated predictions of all models.
     name = "ensemble"
-    blend_w = dict(zip(MODELS, fit_blend_weights(soft_targets, [oof[m] for m in MODELS])))
+    blend_w = dict(zip(MODELS, fit_blend_weights(soft_targets[hq], [oof[m][hq] for m in MODELS])))
     print("Ensemble weights: " + ", ".join(f"{m} {w:.2f}" for m, w in blend_w.items()))
     avg = sum(blend_w[m] * oof[m] for m in MODELS)
-    temps[name] = fit_temperature(soft_targets, avg)
+    temps[name] = fit_temperature(soft_targets[hq], avg[hq])
     oof[name] = temperature_scale(avg, temps[name])
-    cv_kl[name] = kl_per_eeg(soft_targets, oof[name]).mean()
-    print(f"CV KL divergence weighted ensemble (T={temps[name]:.2f}): {cv_kl[name]:.4f}")
+    cv_kl[name] = kl_per_eeg(soft_targets[hq], oof[name][hq]).mean()
+    print(f"CV KL weighted ensemble (T={temps[name]:.2f}): EEGs with >= 10 votes {cv_kl[name]:.4f}, "
+          f"all EEGs {kl_per_eeg(soft_targets, oof[name]).mean():.4f}")
     best = min(cv_kl, key=cv_kl.get)
-    print(f"Best model on CV: {best}")
-    for name in oof:
-        print(f"  {name}: KL on EEGs with >= 10 votes: {kl_per_eeg(soft_targets[high_quality], oof[name][high_quality]).mean():.4f}")
+    print(f"Best model on CV (EEGs with >= 10 votes): {best}")
 
     # Step 5: how certain are these numbers, and is the difference between the models real?
-    per_eeg = {name: kl_per_eeg(soft_targets, oof[name]) for name in oof}
+    # (step 16: on the EEGs with >= 10 votes)
+    per_eeg = {name: kl_per_eeg(soft_targets[hq], oof[name][hq]) for name in oof}
     for name in oof:
         (low, high), se = bootstrap_ci(per_eeg[name])
         print(f"{name}: KL {per_eeg[name].mean():.4f}, bootstrap 95% CI [{low:.4f}, {high:.4f}], SE {se:.4f}")
